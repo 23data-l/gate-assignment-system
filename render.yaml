@@ -1,0 +1,11 @@
+# Render.com free-tier deployment config
+# Deploy: push this repo to GitHub, then "New +" -> "Blueprint" on
+# render.com and point it at the repo. Free tier: 750 hrs/month.
+services:
+  - type: web
+    name: gate-assignment-system
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: 8000

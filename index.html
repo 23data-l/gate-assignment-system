@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Quantum-Inspired Adaptive Gate Assignment</title>
+<style>
+  :root {
+    --bg: #0b1220; --panel: #121b2e; --accent: #4fd1c5; --accent2: #f6ad55;
+    --text: #e2e8f0; --muted: #94a3b8; --danger: #f56565; --gate-line: #1e293b;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family: 'Segoe UI', Roboto, sans-serif; }
+  header { padding: 20px 28px; border-bottom: 1px solid #1e293b; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { font-size: 18px; margin:0; font-weight:600; }
+  header .sub { color: var(--muted); font-size: 13px; margin-top:4px; }
+  .controls { display:flex; gap:10px; padding: 16px 28px; flex-wrap:wrap; align-items:center; background: var(--panel); border-bottom:1px solid #1e293b; }
+  button { background: var(--accent); color:#04231f; border:none; padding:9px 16px; border-radius:6px; font-weight:600; cursor:pointer; font-size:13px; }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid #334155; }
+  button.danger { background: var(--danger); color:white; }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  select, input { background:#0b1220; color:var(--text); border:1px solid #334155; padding:8px; border-radius:6px; font-size:13px; }
+  #status { padding: 10px 28px; font-size:13px; color:var(--muted); min-height: 20px; }
+  #metrics { display:flex; gap: 14px; padding: 0 28px 16px; flex-wrap:wrap; }
+  .metric { background: var(--panel); border:1px solid #1e293b; border-radius:8px; padding:10px 16px; min-width:150px; }
+  .metric .label { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em; }
+  .metric .value { font-size:20px; font-weight:700; margin-top:4px; }
+  #chart-wrap { padding: 10px 28px 40px; overflow-x:auto; }
+  #chart { position:relative; min-width: 1000px; }
+  .gate-row { display:flex; align-items:center; height:34px; border-bottom:1px solid var(--gate-line); }
+  .gate-label { width:90px; flex-shrink:0; font-size:12px; color:var(--muted); }
+  .track { position:relative; flex:1; height:26px; background:#0d1526; border-radius:4px; }
+  .flight-bar { position:absolute; top:2px; height:22px; border-radius:4px; font-size:10px; color:#04231f; display:flex; align-items:center; padding:0 6px; overflow:hidden; white-space:nowrap; cursor:default; transition: left 0.4s ease, width 0.4s ease, background 0.4s ease; }
+  .flight-bar.size0 { background: #90cdf4; }
+  .flight-bar.size1 { background: var(--accent); }
+  .flight-bar.size2 { background: var(--accent2); }
+  .flight-bar.affected { outline: 2px solid var(--danger); z-index: 5; }
+  .timeaxis { display:flex; margin-left:90px; font-size:10px; color:var(--muted); margin-bottom:6px; }
+  .timeaxis span { flex:1; text-align:left; }
+  footer { padding: 16px 28px; font-size:11px; color:var(--muted); border-top:1px solid #1e293b; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Quantum-Inspired Adaptive Gate Assignment System</h1>
+    <div class="sub">QUBO + simulated quantum annealing &middot; dynamic delay re-optimization &middot; real BLR flight data</div>
+  </div>
+</header>
+
+<div class="controls">
+  <button id="btnReset" class="secondary">New Scenario</button>
+  <button id="btnSolveQ">Solve (Quantum-Inspired)</button>
+  <button id="btnSolveC" class="secondary">Solve (Classical ILP)</button>
+  <span style="width:1px;height:24px;background:#334155;"></span>
+  <select id="flightSelect"></select>
+  <input id="delayMinutes" type="number" value="60" min="5" max="300" style="width:80px;">
+  <button id="btnDelay" class="danger">Trigger Delay</button>
+</div>
+
+<div id="status">Ready.</div>
+
+<div id="metrics">
+  <div class="metric"><div class="label">Flights</div><div class="value" id="mFlights">-</div></div>
+  <div class="metric"><div class="label">Gates</div><div class="value" id="mGates">-</div></div>
+  <div class="metric"><div class="label">Solve Time</div><div class="value" id="mSolveTime">-</div></div>
+  <div class="metric"><div class="label">Method</div><div class="value" id="mMethod" style="font-size:13px;">-</div></div>
+  <div class="metric"><div class="label">Flights Touched (last delay)</div><div class="value" id="mTouched">-</div></div>
+</div>
+
+<div id="chart-wrap">
+  <div class="timeaxis" id="timeaxis"></div>
+  <div id="chart"></div>
+</div>
+
+<footer>Gate/aircraft-size color key: light blue = regional, teal = narrow-body, orange = wide-body. Red outline = flights touched by the most recent delay re-optimization.</footer>
+
+<script>
+const API = "/api";
+let schedule = { flights: [], gates: [], assignment: {} };
+const DAY_MIN = 24 * 60;
+
+async function api(path, opts) {
+  const res = await fetch(API + path, opts);
+  if (!res.ok) { const t = await res.text(); throw new Error(t); }
+  return res.json();
+}
+
+function setStatus(msg, isError) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.style.color = isError ? '#f56565' : '#94a3b8';
+}
+
+async function loadSchedule() {
+  schedule = await api('/schedule');
+  populateFlightSelect();
+  render([]);
+}
+
+function populateFlightSelect() {
+  const sel = document.getElementById('flightSelect');
+  sel.innerHTML = '';
+  schedule.flights.forEach(function(f) {
+    const opt = document.createElement('option');
+    opt.value = f.flight_id;
+    opt.textContent = f.flight_id;
+    sel.appendChild(opt);
+  });
+}
+
+function render(affected) {
+  affected = affected || [];
+  document.getElementById('mFlights').textContent = schedule.flights.length;
+  document.getElementById('mGates').textContent = schedule.gates.length;
+
+  const chart = document.getElementById('chart');
+  chart.innerHTML = '';
+
+  const axis = document.getElementById('timeaxis');
+  axis.innerHTML = '';
+  for (let h = 0; h <= 24; h += 3) {
+    const span = document.createElement('span');
+    span.textContent = String(h).padStart(2,'0') + ':00';
+    axis.appendChild(span);
+  }
+
+  const flightById = {};
+  schedule.flights.forEach(function(f){ flightById[f.flight_id] = f; });
+
+  schedule.gates.forEach(function(gate) {
+    const row = document.createElement('div');
+    row.className = 'gate-row';
+    const label = document.createElement('div');
+    label.className = 'gate-label';
+    label.textContent = gate.gate_id;
+    row.appendChild(label);
+
+    const track = document.createElement('div');
+    track.className = 'track';
+
+    Object.keys(schedule.assignment).forEach(function(fid) {
+      const gid = schedule.assignment[fid];
+      if (gid !== gate.gate_id) return;
+      const f = flightById[fid];
+      if (!f) return;
+      const left = (f.arrival / DAY_MIN) * 100;
+      const width = Math.max(((f.departure - f.arrival) / DAY_MIN) * 100, 1.5);
+      const bar = document.createElement('div');
+      bar.className = 'flight-bar size' + f.size_class + (affected.indexOf(fid) !== -1 ? ' affected' : '');
+      bar.style.left = left + '%';
+      bar.style.width = width + '%';
+      bar.textContent = fid;
+      bar.title = fid + ' | ' + f.arrival.toFixed(0) + '-' + f.departure.toFixed(0) + 'min | ' + f.passengers + ' pax';
+      track.appendChild(bar);
+    });
+
+    row.appendChild(track);
+    chart.appendChild(row);
+  });
+}
+
+document.getElementById('btnReset').onclick = async function() {
+  setStatus('Generating new scenario from real BLR route data...');
+  await api('/reset', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({}) });
+  await loadSchedule();
+  document.getElementById('mSolveTime').textContent = '-';
+  document.getElementById('mMethod').textContent = '-';
+  document.getElementById('mTouched').textContent = '-';
+  setStatus('New scenario loaded. Click Solve to assign gates.');
+};
+
+document.getElementById('btnSolveQ').onclick = async function() {
+  setStatus('Solving with quantum-inspired simulated annealing...');
+  const res = await api('/solve', { method: 'POST' });
+  schedule.assignment = res.assignment;
+  render([]);
+  document.getElementById('mSolveTime').textContent = res.info.solve_time_s.toFixed(2) + 's';
+  document.getElementById('mMethod').textContent = 'Quantum-Inspired (SA)';
+  setStatus('Solved. ' + Object.keys(res.assignment).length + ' flights assigned.');
+};
+
+document.getElementById('btnSolveC').onclick = async function() {
+  setStatus('Solving with classical ILP (CP-SAT)...');
+  const res = await api('/solve/classical', { method: 'POST' });
+  schedule.assignment = res.assignment;
+  render([]);
+  document.getElementById('mSolveTime').textContent = res.info.solve_time_s.toFixed(2) + 's';
+  document.getElementById('mMethod').textContent = 'Classical ILP (' + res.info.status + ')';
+  setStatus('Solved with classical baseline.');
+};
+
+document.getElementById('btnDelay').onclick = async function() {
+  const flight_id = document.getElementById('flightSelect').value;
+  const delay_minutes = parseFloat(document.getElementById('delayMinutes').value);
+  if (!flight_id) return;
+  if (Object.keys(schedule.assignment).length === 0) {
+    setStatus('Run a solve first before triggering a delay.', true);
+    return;
+  }
+  setStatus('Delaying ' + flight_id + ' by ' + delay_minutes + ' min and re-optimizing incrementally...');
+  try {
+    const res = await api('/delay', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ flight_id: flight_id, delay_minutes: delay_minutes })
+    });
+    schedule.assignment = res.assignment;
+    const f = res.updated_flight;
+    schedule.flights = schedule.flights.map(function(x){ return x.flight_id === f.flight_id ? f : x; });
+    render(res.affected_flights);
+    document.getElementById('mSolveTime').textContent = res.solve_time_s.toFixed(3) + 's';
+    document.getElementById('mMethod').textContent = 'Incremental Re-opt';
+    document.getElementById('mTouched').textContent = res.affected_flights.length + ' / ' + schedule.flights.length;
+    setStatus('Re-optimized in ' + res.solve_time_s.toFixed(3) + 's. Only ' + res.affected_flights.length + ' flight(s) needed reassignment: ' + res.affected_flights.join(', '));
+  } catch (e) {
+    setStatus('Error: ' + e.message, true);
+  }
+};
+
+loadSchedule();
+</script>
+</body>
+</html>
